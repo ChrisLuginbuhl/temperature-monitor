@@ -1,4 +1,4 @@
-name: Particle Event Collector
+name: Particle Variable Collector
 
 on:
   schedule:
@@ -25,23 +25,22 @@ jobs:
         npm init -y
         npm install axios googleapis
         
-    - name: Collect Particle Events and Update Google Sheets
+    - name: Collect Particle Variable and Update Google Sheets
       env:
         PARTICLE_ACCESS_TOKEN: ${{ secrets.PARTICLE_ACCESS_TOKEN }}
         GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         SHEET_NAME: ${{ secrets.SHEET_NAME }}
         DEVICE_ID: ${{ secrets.DEVICE_ID }}
-        EVENT_NAME: ${{ secrets.EVENT_NAME }}
+        VARIABLE_NAME: ${{ secrets.VARIABLE_NAME }}
       run: |
         cat > collect-data.js << 'EOF'
         const axios = require('axios');
         const { google } = require('googleapis');
-        const fs = require('fs');
 
         async function main() {
           try {
-            console.log('Starting Particle event collection...');
+            console.log('Starting Particle variable collection...');
             
             // Configuration from environment variables
             const config = {
@@ -49,74 +48,52 @@ jobs:
               spreadsheetId: process.env.SPREADSHEET_ID,
               sheetName: process.env.SHEET_NAME || 'Sheet1',
               deviceId: process.env.DEVICE_ID,
-              eventName: process.env.EVENT_NAME
+              variableName: process.env.VARIABLE_NAME || 'sensorData'
             };
 
             // Validate required environment variables
-            const required = ['particleToken', 'spreadsheetId', 'deviceId', 'eventName'];
+            const required = ['particleToken', 'spreadsheetId', 'deviceId'];
             for (const key of required) {
               if (!config[key]) {
                 throw new Error(`Missing required environment variable: ${key.toUpperCase()}`);
               }
             }
 
-            // Get current time and 15 minutes ago (buffer for polling interval)
-            const now = new Date();
-            const fifteenMinutesAgo = new Date(now.getTime() - 15 * 60 * 1000);
-            
-            console.log(`Fetching events from ${fifteenMinutesAgo.toISOString()} to ${now.toISOString()}`);
+            console.log(`Fetching variable '${config.variableName}' from device ${config.deviceId}`);
 
-            // Fetch events from Particle API (using the more reliable endpoint)
-            const eventsUrl = config.deviceId 
-              ? `https://api.particle.io/v1/devices/${config.deviceId}/events/${config.eventName}`
-              : `https://api.particle.io/v1/devices/events/${config.eventName}`;
+            // Fetch variable from Particle API
+            const variableUrl = `https://api.particle.io/v1/devices/${config.deviceId}/${config.variableName}`;
             
-            console.log(`Fetching from: ${eventsUrl}`);
-            
-            const eventsResponse = await axios.get(eventsUrl, {
+            const variableResponse = await axios.get(variableUrl, {
               headers: {
                 'Authorization': `Bearer ${config.particleToken}`,
                 'Accept': 'application/json'
               },
-              timeout: 15000,
-              validateStatus: function (status) {
-                return status < 500; // Accept 4xx errors but not 5xx
-              }
+              timeout: 10000
             });
 
-            console.log(`Received ${eventsResponse.data.length || 0} total events`);
-            
-            // Debug: Show all events found
-            if (eventsResponse.data && Array.isArray(eventsResponse.data)) {
-              console.log('All events found:');
-              eventsResponse.data.forEach((event, index) => {
-                console.log(`  Event ${index + 1}: name="${event.name}", time="${event.published_at}", data="${event.data}"`);
-              });
-            }
+            console.log('Variable response:', variableResponse.data);
 
-            // Filter events by name and time
-            let relevantEvents = [];
-            if (eventsResponse.data && Array.isArray(eventsResponse.data)) {
-              relevantEvents = eventsResponse.data.filter(event => {
-                console.log(`Checking event: name="${event.name}" vs expected="${config.eventName}"`);
-                if (event.name !== config.eventName) {
-                  console.log(`  -> Skipped: name mismatch`);
-                  return false;
-                }
-                
-                const eventTime = new Date(event.published_at);
-                console.log(`  -> Event time: ${eventTime.toISOString()}, Window: ${fifteenMinutesAgo.toISOString()} to ${now.toISOString()}`);
-                const inTimeWindow = eventTime >= fifteenMinutesAgo && eventTime <= now;
-                console.log(`  -> In time window: ${inTimeWindow}`);
-                return inTimeWindow;
-              });
-            }
-
-            console.log(`Found ${relevantEvents.length} relevant events for '${config.eventName}'`);
-
-            if (relevantEvents.length === 0) {
-              console.log('No new events to process');
+            if (!variableResponse.data || !variableResponse.data.result) {
+              console.log('No variable data returned');
               return;
+            }
+
+            const variableValue = variableResponse.data.result;
+            const timestamp = new Date().toISOString();
+            
+            console.log(`Variable value: ${variableValue}`);
+
+            // Parse the sensor data (assuming format: temp|||pressure|||humidity)
+            const parts = variableValue.split('|||');
+            let temperature = 'N/A';
+            let pressure = 'N/A';
+            let humidity = 'N/A';
+            
+            if (parts.length >= 3) {
+              temperature = parts[0];
+              pressure = parts[1];
+              humidity = parts[2];
             }
 
             // Set up Google Sheets API
@@ -128,21 +105,48 @@ jobs:
 
             const sheets = google.sheets({ version: 'v4', auth });
 
-            // Prepare data for Google Sheets
-            const rows = relevantEvents.map(event => [
-              event.published_at,
-              event.name,
-              event.data || '',
-              event.device_id || config.deviceId,
-              event.ttl || '',
-              new Date().toISOString() // Processing timestamp
-            ]);
+            // Check for existing data to avoid duplicates
+            console.log('Checking for existing data...');
+            
+            let shouldAddData = true;
+            try {
+              const existingData = await sheets.spreadsheets.values.get({
+                spreadsheetId: config.spreadsheetId,
+                range: `${config.sheetName}!A:G`,
+              });
+
+              if (existingData.data.values && existingData.data.values.length > 1) {
+                // Check the last few rows to see if we already have this exact data
+                const recentRows = existingData.data.values.slice(-5); // Check last 5 rows
+                
+                for (const row of recentRows) {
+                  if (row.length >= 4 && row[1] === temperature && row[2] === pressure && row[3] === humidity) {
+                    // Check if this data is from within the last hour (to avoid too much duplication)
+                    const rowTime = new Date(row[0]);
+                    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+                    
+                    if (rowTime > oneHourAgo) {
+                      console.log('Identical data found in recent entries, skipping...');
+                      shouldAddData = false;
+                      break;
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.log('Could not check existing data, proceeding anyway:', error.message);
+            }
+
+            if (!shouldAddData) {
+              console.log('No new data to add');
+              return;
+            }
 
             // Check if sheet has headers, add them if not
             try {
               const headerCheck = await sheets.spreadsheets.values.get({
                 spreadsheetId: config.spreadsheetId,
-                range: `${config.sheetName}!A1:F1`
+                range: `${config.sheetName}!A1:G1`
               });
 
               if (!headerCheck.data.values || headerCheck.data.values.length === 0) {
@@ -152,7 +156,7 @@ jobs:
                   range: config.sheetName,
                   valueInputOption: 'RAW',
                   resource: {
-                    values: [['Published At', 'Event Name', 'Data', 'Device ID', 'TTL', 'Processed At']]
+                    values: [['Timestamp', 'Temperature (°C)', 'Pressure (hPa)', 'Humidity (%)', 'Raw Data', 'Device ID', 'Collection Time']]
                   }
                 });
               }
@@ -160,23 +164,30 @@ jobs:
               console.log('Could not check/add headers, continuing anyway:', error.message);
             }
 
+            // Prepare data row
+            const newRow = [
+              timestamp,
+              temperature,
+              pressure, 
+              humidity,
+              variableValue,
+              config.deviceId,
+              new Date().toISOString()
+            ];
+
             // Append new data to Google Sheets
             const appendResult = await sheets.spreadsheets.values.append({
               spreadsheetId: config.spreadsheetId,
               range: config.sheetName,
               valueInputOption: 'RAW',
               resource: {
-                values: rows
+                values: [newRow]
               }
             });
 
-            console.log(`Successfully added ${rows.length} rows to Google Sheets`);
+            console.log(`Successfully added new row to Google Sheets`);
             console.log(`Updated range: ${appendResult.data.updates.updatedRange}`);
-
-            // Log the events for debugging
-            relevantEvents.forEach((event, index) => {
-              console.log(`Event ${index + 1}: ${event.published_at} - ${event.data}`);
-            });
+            console.log(`Data: T=${temperature}°C, P=${pressure}hPa, H=${humidity}%`);
 
           } catch (error) {
             console.error('Error in main function:', error);
