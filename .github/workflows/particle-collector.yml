@@ -2,8 +2,8 @@ name: Particle Event Collector
 
 on:
   schedule:
-    # Run every 30 minutes - adjust as needed
-    - cron: '*/30 * * * *'
+    # Run every 10 minutes - adjust as needed
+    - cron: '*/10 * * * *'
   # Allow manual triggering for testing
   workflow_dispatch:
 
@@ -60,35 +60,55 @@ jobs:
               }
             }
 
-            // Get current time and 40 minutes ago (buffer for polling interval)
+            // Get current time and 15 minutes ago (buffer for polling interval)
             const now = new Date();
-            const fortyMinutesAgo = new Date(now.getTime() - 40 * 60 * 1000);
+            const fifteenMinutesAgo = new Date(now.getTime() - 15 * 60 * 1000);
             
-            console.log(`Fetching events from ${fortyMinutesAgo.toISOString()} to ${now.toISOString()}`);
+            console.log(`Fetching events from ${fifteenMinutesAgo.toISOString()} to ${now.toISOString()}`);
 
-            // Fetch events from Particle API
+            // Fetch events from Particle API (using the more reliable endpoint)
             const eventsUrl = config.deviceId 
-              ? `https://api.particle.io/v1/devices/${config.deviceId}/events`
-              : 'https://api.particle.io/v1/devices/events';
+              ? `https://api.particle.io/v1/devices/${config.deviceId}/events/${config.eventName}`
+              : `https://api.particle.io/v1/devices/events/${config.eventName}`;
+            
+            console.log(`Fetching from: ${eventsUrl}`);
             
             const eventsResponse = await axios.get(eventsUrl, {
               headers: {
                 'Authorization': `Bearer ${config.particleToken}`,
                 'Accept': 'application/json'
               },
-              timeout: 30000
+              timeout: 15000,
+              validateStatus: function (status) {
+                return status < 500; // Accept 4xx errors but not 5xx
+              }
             });
 
             console.log(`Received ${eventsResponse.data.length || 0} total events`);
+            
+            // Debug: Show all events found
+            if (eventsResponse.data && Array.isArray(eventsResponse.data)) {
+              console.log('All events found:');
+              eventsResponse.data.forEach((event, index) => {
+                console.log(`  Event ${index + 1}: name="${event.name}", time="${event.published_at}", data="${event.data}"`);
+              });
+            }
 
             // Filter events by name and time
             let relevantEvents = [];
             if (eventsResponse.data && Array.isArray(eventsResponse.data)) {
               relevantEvents = eventsResponse.data.filter(event => {
-                if (event.name !== config.eventName) return false;
+                console.log(`Checking event: name="${event.name}" vs expected="${config.eventName}"`);
+                if (event.name !== config.eventName) {
+                  console.log(`  -> Skipped: name mismatch`);
+                  return false;
+                }
                 
                 const eventTime = new Date(event.published_at);
-                return eventTime >= fortyMinutesAgo && eventTime <= now;
+                console.log(`  -> Event time: ${eventTime.toISOString()}, Window: ${fifteenMinutesAgo.toISOString()} to ${now.toISOString()}`);
+                const inTimeWindow = eventTime >= fifteenMinutesAgo && eventTime <= now;
+                console.log(`  -> In time window: ${inTimeWindow}`);
+                return inTimeWindow;
               });
             }
 
