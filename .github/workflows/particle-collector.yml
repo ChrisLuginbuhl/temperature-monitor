@@ -33,6 +33,8 @@ jobs:
         SHEET_NAME: ${{ secrets.SHEET_NAME }}
         DEVICE_ID: ${{ secrets.DEVICE_ID }}
         VARIABLE_NAME: ${{ secrets.VARIABLE_NAME }}
+        MAX_ROWS: ${{ secrets.MAX_ROWS }} # Optional: defaults to 100000
+        CLEANUP_BATCH_SIZE: ${{ secrets.CLEANUP_BATCH_SIZE }} # Optional: defaults to 1000
       run: |
         cat > collect-data.js << 'EOF'
         const axios = require('axios');
@@ -48,7 +50,9 @@ jobs:
               spreadsheetId: process.env.SPREADSHEET_ID,
               sheetName: process.env.SHEET_NAME || 'Sheet1',
               deviceId: process.env.DEVICE_ID,
-              variableName: process.env.VARIABLE_NAME || 'sensorData'
+              variableName: process.env.VARIABLE_NAME || 'sensorData',
+              maxRows: parseInt(process.env.MAX_ROWS) || 100000, // Default to 100k rows
+              cleanupBatchSize: parseInt(process.env.CLEANUP_BATCH_SIZE) || 1000 // Delete this many rows at once
             };
 
             // Validate required environment variables
@@ -60,6 +64,7 @@ jobs:
             }
 
             console.log(`Fetching variable '${config.variableName}' from device ${config.deviceId}`);
+            console.log(`Max rows configured: ${config.maxRows}`);
 
             // Fetch variable from Particle API
             const variableUrl = `https://api.particle.io/v1/devices/${config.deviceId}/${config.variableName}`;
@@ -105,30 +110,37 @@ jobs:
 
             const sheets = google.sheets({ version: 'v4', auth });
 
-            // Check for existing data to avoid duplicates
-            console.log('Checking for existing data...');
+            // Check for existing data to avoid duplicates and manage row count
+            console.log('Checking existing data and row count...');
             
             let shouldAddData = true;
+            let currentRowCount = 0;
+            
             try {
               const existingData = await sheets.spreadsheets.values.get({
                 spreadsheetId: config.spreadsheetId,
                 range: `${config.sheetName}!A:G`,
               });
 
-              if (existingData.data.values && existingData.data.values.length > 1) {
-                // Check the last few rows to see if we already have this exact data
-                const recentRows = existingData.data.values.slice(-5); // Check last 5 rows
+              if (existingData.data.values && existingData.data.values.length > 0) {
+                currentRowCount = existingData.data.values.length;
+                console.log(`Current row count: ${currentRowCount}`);
                 
-                for (const row of recentRows) {
-                  if (row.length >= 4 && row[1] === temperature && row[2] === pressure && row[3] === humidity) {
-                    // Check if this data is from within the last hour (to avoid too much duplication)
-                    const rowTime = new Date(row[0]);
-                    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-                    
-                    if (rowTime > oneHourAgo) {
-                      console.log('Identical data found in recent entries, skipping...');
-                      shouldAddData = false;
-                      break;
+                // Check the last few rows to see if we already have this exact data
+                if (currentRowCount > 1) {
+                  const recentRows = existingData.data.values.slice(-5); // Check last 5 rows
+                  
+                  for (const row of recentRows) {
+                    if (row.length >= 4 && row[1] === temperature && row[2] === pressure && row[3] === humidity) {
+                      // Check if this data is from within the last hour (to avoid too much duplication)
+                      const rowTime = new Date(row[0]);
+                      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+                      
+                      if (rowTime > oneHourAgo) {
+                        console.log('Identical data found in recent entries, skipping...');
+                        shouldAddData = false;
+                        break;
+                      }
                     }
                   }
                 }
@@ -140,6 +152,46 @@ jobs:
             if (!shouldAddData) {
               console.log('No new data to add');
               return;
+            }
+
+            // Check if we need to clean up old data before adding new data
+            if (currentRowCount >= config.maxRows) {
+              console.log(`Row count (${currentRowCount}) exceeds or approaches max (${config.maxRows}). Cleaning up old data...`);
+              
+              try {
+                // Calculate how many rows to delete (keep some buffer)
+                const rowsToDelete = Math.min(config.cleanupBatchSize, currentRowCount - config.maxRows + config.cleanupBatchSize);
+                
+                console.log(`Deleting ${rowsToDelete} oldest rows...`);
+                
+                // Delete rows starting from row 2 (after header) to row 2+rowsToDelete
+                // Note: Google Sheets API uses 1-based indexing
+                const deleteRequest = {
+                  spreadsheetId: config.spreadsheetId,
+                  resource: {
+                    requests: [{
+                      deleteDimension: {
+                        range: {
+                          sheetId: 0, // Assuming first sheet, you may need to get the actual sheet ID
+                          dimension: 'ROWS',
+                          startIndex: 1, // Row 2 (0-based, so 1 = row 2)
+                          endIndex: 1 + rowsToDelete // Delete rowsToDelete rows
+                        }
+                      }
+                    }]
+                  }
+                };
+
+                await sheets.spreadsheets.batchUpdate(deleteRequest);
+                console.log(`Successfully deleted ${rowsToDelete} old rows`);
+                
+                // Update current row count
+                currentRowCount -= rowsToDelete;
+                
+              } catch (error) {
+                console.error('Error during cleanup:', error);
+                console.log('Continuing with data insertion despite cleanup error...');
+              }
             }
 
             // Check if sheet has headers, add them if not
@@ -188,6 +240,7 @@ jobs:
             console.log(`Successfully added new row to Google Sheets`);
             console.log(`Updated range: ${appendResult.data.updates.updatedRange}`);
             console.log(`Data: T=${temperature}°C, P=${pressure}hPa, H=${humidity}%`);
+            console.log(`Current estimated row count: ${currentRowCount + 1}`);
 
           } catch (error) {
             console.error('Error in main function:', error);
